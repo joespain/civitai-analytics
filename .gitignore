@@ -1,0 +1,8 @@
+data/civitai_state.json
+data/civitai_posts.json
+data/config.json
+__pycache__/
+*.pyc
+.env
+venv/
+*.log
