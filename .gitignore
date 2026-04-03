@@ -1,6 +1,10 @@
 data/civitai_state.json
+data/*.json.bak
 data/civitai_posts.json
 data/config.json
+data/civitai.db
+data/civitai.db-wal
+data/civitai.db-shm
 __pycache__/
 *.pyc
 .env

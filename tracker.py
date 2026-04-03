@@ -16,9 +16,9 @@ from datetime import datetime, timezone
 
 import requests
 
-BASE = os.path.dirname(__file__)
-STATE_FILE = os.path.join(BASE, "data", "civitai_state.json")
-POSTS_META_FILE = os.path.join(BASE, "data", "civitai_posts.json")
+import db
+
+BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE, "data", "config.json")
 LIMIT = 100  # images per page
 
@@ -81,33 +81,14 @@ def aggregate_posts(items):
     return posts
 
 
-def load_post_meta():
-    if os.path.exists(POSTS_META_FILE):
-        with open(POSTS_META_FILE) as f:
-            data = json.load(f)
-            return data.get("posts", {})
-    return {}
-
-
-def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    return {"posts": {}, "history": [], "lastChecked": None}
-
-
-def save_state(state):
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
-
-
 def score(post):
     """Engagement score: hearts weighted higher than likes."""
     return post["hearts"] * 2 + post["likes"] + post["laughs"] * 0.5
 
 
 def main(notify=False):
+    db.init_db()
+
     config = load_config()
     api_key = config.get("api_key", "")
     username = config.get("username", "")
@@ -121,9 +102,10 @@ def main(notify=False):
         return None
 
     now = datetime.now(timezone.utc).isoformat()
-    state = load_state()
-    old_posts = state.get("posts", {})
-    post_meta = load_post_meta()
+
+    # Load previous stats from DB for zero-stat guard and alert detection
+    old_posts = db.get_latest_post_stats()
+    post_meta = db.load_post_meta()
 
     try:
         # Fetch first page only for live stats (subsequent pages return 0 stats from CivitAI)
@@ -148,8 +130,8 @@ def main(notify=False):
             new_posts[pid]["laughs"] = stat_post["laughs"]
             new_posts[pid]["cries"] = stat_post["cries"]
 
-    # For ALL posts: never overwrite good stats with zeros
-    # (CivitAI API caches periodically and may return 0 for older pages)
+    # Zero-stat guard is applied inside save_snapshot(), but we also apply it here
+    # so alert detection (below) uses guarded values.
     for pid, post in new_posts.items():
         old = old_posts.get(pid)
         if old:
@@ -193,16 +175,31 @@ def main(notify=False):
                 "likeDelta": like_delta,
             })
 
-    # Merge post metadata into posts
-    for pid, post in new_posts.items():
-        meta = post_meta.get(pid, {})
-        post["title"] = meta.get("title", "")
-        post["characters"] = meta.get("characters", [])
-        post["tags"] = meta.get("tags", [])
-        post["theme"] = meta.get("theme", "")
-        post["notes"] = meta.get("notes", "")
+    # Save snapshot to DB (zero-stat guard applied again inside save_snapshot for safety)
+    db.save_snapshot(new_posts, now)
 
-    # Build daily snapshot entry
+    # Build top posts list for the report (using post meta from DB)
+    top_posts = sorted(
+        [
+            {
+                "postId": k,
+                "date": v["date"],
+                "score": score(v),
+                "hearts": v["hearts"],
+                "likes": v["likes"],
+                "nsfwLevels": v["nsfwLevels"],
+                "imageCount": v["imageCount"],
+                "title": post_meta.get(k, {}).get("title", ""),
+                "characters": post_meta.get(k, {}).get("characters", []),
+                "tags": post_meta.get(k, {}).get("tags", []),
+                "theme": (post_meta.get(k, {}).get("themes") or [""])[0],
+            }
+            for k, v in new_posts.items()
+        ],
+        key=lambda x: x["score"],
+        reverse=True,
+    )[:5]
+
     snapshot = {
         "timestamp": now,
         "totalPosts": len(new_posts),
@@ -210,38 +207,8 @@ def main(notify=False):
         "totalHearts": sum(p["hearts"] for p in new_posts.values()),
         "totalLikes": sum(p["likes"] for p in new_posts.values()),
         "totalComments": sum(p["comments"] for p in new_posts.values()),
-        "topPosts": sorted(
-            [
-                {
-                    "postId": k,
-                    "date": v["date"],
-                    "score": score(v),
-                    "hearts": v["hearts"],
-                    "likes": v["likes"],
-                    "nsfwLevels": v["nsfwLevels"],
-                    "imageCount": v["imageCount"],
-                    "title": v.get("title", ""),
-                    "characters": v.get("characters", []),
-                    "tags": v.get("tags", []),
-                    "theme": v.get("theme", ""),
-                }
-                for k, v in new_posts.items()
-            ],
-            key=lambda x: x["score"],
-            reverse=True,
-        )[:5],
+        "topPosts": top_posts,
     }
-
-    # Append to history (keep last 90 snapshots)
-    history = state.get("history", [])
-    history.append(snapshot)
-    if len(history) > 90:
-        history = history[-90:]
-
-    state["posts"] = new_posts
-    state["history"] = history
-    state["lastChecked"] = now
-    save_state(state)
 
     report = {
         "snapshot": snapshot,
@@ -256,9 +223,28 @@ def main(notify=False):
     return report
 
 
-def analyze(state):
-    """Cross-reference engagement with post metadata and surface patterns."""
-    posts = state.get("posts", {})
+def analyze(posts_dict=None):
+    """Cross-reference engagement with post metadata and surface patterns.
+    Accepts an optional posts_dict; if not provided, loads latest from DB."""
+    if posts_dict is None:
+        raw = db.get_latest_post_stats()
+        meta = db.load_post_meta()
+        posts = {}
+        for pid, p in raw.items():
+            m = meta.get(pid, {})
+            posts[pid] = {
+                "hearts": p["hearts"],
+                "likes": p["likes"],
+                "laughs": p.get("laughs", 0),
+                "imageCount": p.get("image_count", 0),
+                "nsfwLevels": p.get("nsfw_levels", []),
+                "characters": m.get("characters", []),
+                "tags": m.get("tags", []),
+                "theme": (m.get("themes") or [""])[0],
+            }
+    else:
+        posts = posts_dict
+
     labeled = [p for p in posts.values() if p.get("tags") or p.get("characters") or p.get("theme")]
     if not labeled:
         print("\n[No labeled posts yet — use the Settings tab to configure, then label posts in the Posts tab]")
@@ -308,7 +294,7 @@ def analyze(state):
     print("\nImage count vs avg score:")
     buckets = {"1": [], "2-5": [], "6-10": [], "11+": []}
     for p in posts.values():
-        n = p["imageCount"]
+        n = p.get("imageCount", p.get("image_count", 0))
         s = score(p)
         if n == 1:
             buckets["1"].append(s)
@@ -366,5 +352,4 @@ if __name__ == "__main__":
     print_summary(report)
 
     if args.analyze:
-        state = load_state()
-        analyze(state)
+        analyze()

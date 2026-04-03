@@ -7,18 +7,19 @@ Then open: http://localhost:5757
 
 import json
 import os
-from collections import defaultdict
 
 import requests
 from flask import Flask, render_template_string, request, jsonify
 
+import db
+import tracker as civitai_tracker
+
 BASE = os.path.dirname(__file__)
 DATA_DIR = os.path.join(BASE, "data")
-STATE_FILE = os.path.join(DATA_DIR, "civitai_state.json")
-POSTS_META_FILE = os.path.join(DATA_DIR, "civitai_posts.json")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 
 os.makedirs(DATA_DIR, exist_ok=True)
+db.init_db()
 
 app = Flask(__name__)
 
@@ -37,53 +38,8 @@ def save_config(cfg):
         json.dump(cfg, f, indent=2)
 
 
-# ── State / meta helpers ────────────────────────────────────────────────────
-
-def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    return {"posts": {}, "history": []}
-
-
-def load_meta():
-    if os.path.exists(POSTS_META_FILE):
-        with open(POSTS_META_FILE) as f:
-            data = json.load(f)
-            return data.get("posts", {})
-    return {}
-
-
-def save_meta(meta):
-    existing = {}
-    if os.path.exists(POSTS_META_FILE):
-        with open(POSTS_META_FILE) as f:
-            existing = json.load(f)
-    existing["posts"] = meta
-    with open(POSTS_META_FILE, "w") as f:
-        json.dump(existing, f, indent=2)
-
-
-def get_known(meta):
-    characters, tags, themes = set(), set(), set()
-    for m in meta.values():
-        for c in m.get("characters", []):
-            if c:
-                characters.add(c)
-        for t in m.get("tags", []):
-            if t:
-                tags.add(t)
-        for t in m.get("themes", []):
-            if t:
-                themes.add(t)
-        th = m.get("theme", "")
-        if th:
-            themes.add(th)
-    return {
-        "characters": sorted(characters),
-        "tags": sorted(tags),
-        "themes": sorted(themes),
-    }
+# ── State / meta helpers (now delegated to db) ──────────────────────────────
+# Kept minimal for config only; all post data goes through db.py
 
 
 # ── HTML ────────────────────────────────────────────────────────────────────
@@ -458,15 +414,26 @@ HTML = """
       <div class="nav-tab active" id="tab-posts" onclick="switchTab('posts')">✏️ Posts</div>
       <div class="nav-tab" id="tab-settings" onclick="switchTab('settings')">⚙️ Settings</div>
     </div>
-    <div class="header-right">
+    <div class="header-right" style="gap:12px;display:flex;align-items:center;">
+      <button class="btn btn-secondary" id="refresh-btn" onclick="refreshData()" style="padding:7px 16px;font-size:0.82rem;">🔄 Refresh</button>
+      <span id="refresh-status" style="font-size:0.82rem;color:#888;display:none;"></span>
       <span id="header-status" style="font-size:0.85rem;color:#888;">Loading...</span>
     </div>
   </header>
 
   <!-- Dashboard tab -->
   <div class="tab-content" id="content-dashboard">
-    <div class="dashboard" id="dashboard-content">
-      <div class="empty-hint">Loading dashboard...</div>
+    <div class="dashboard">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;">
+        <div style="font-weight:700;color:#fff;">Dashboard</div>
+        <div style="display:flex;align-items:center;gap:10px;">
+          <button class="btn btn-secondary" id="refresh-btn" onclick="refreshData()">🔄 Refresh Data</button>
+          <span id="refresh-status" style="display:none;font-size:0.85rem;color:#888;">Fetching from CivitAI…</span>
+        </div>
+      </div>
+      <div id="dashboard-content">
+        <div class="empty-hint">Loading dashboard...</div>
+      </div>
     </div>
   </div>
 
@@ -576,7 +543,7 @@ function filterPosts() {
           || (m.title || '').toLowerCase().includes(q)
           || (m.characters || []).join(' ').toLowerCase().includes(q)
           || (m.tags || []).join(' ').toLowerCase().includes(q)
-          || (m.theme || '').toLowerCase().includes(q);
+          || (m.themes || []).join(' ').toLowerCase().includes(q);
       })
     : allPosts;
   renderList(filtered);
@@ -586,7 +553,7 @@ function renderList(posts) {
   const el = document.getElementById('post-list');
   el.innerHTML = posts.map(p => {
     const m = allMeta[p.postId] || {};
-    const labeled = m.title || (m.characters||[]).length || (m.tags||[]).length;
+    const labeled = m.title || (m.characters||[]).length || (m.tags||[]).length || (m.themes||[]).length || ((m.notes||'').trim().length);
     const levels = [...new Set(p.nsfwLevels)].map(l =>
       `<span class="nsfw-badge badge-${l}">${l}</span>`).join('');
     const chars = (m.characters||[]).join(', ');
@@ -821,6 +788,47 @@ function clearPost() {
 }
 
 // ── Dashboard ──────────────────────────────────────────────────────────────
+async function refreshData() {
+  const btn = document.getElementById('refresh-btn');
+  const status = document.getElementById('refresh-status');
+  if (btn) {
+    btn.disabled = true;
+    btn.style.opacity = 0.7;
+  }
+  if (status) {
+    status.style.display = 'inline';
+    status.textContent = 'Fetching from CivitAI…';
+  }
+
+  try {
+    const r = await fetch('/api/refresh', { method: 'POST' });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || !d.ok) {
+      throw new Error(d.error || `Refresh failed (HTTP ${r.status})`);
+    }
+
+    // Reload dashboard and post list
+    dashLoaded = false;
+    await init();
+    await loadDashboard();
+
+    if (status) {
+      status.textContent = '✓ Updated';
+      setTimeout(() => { status.style.display = 'none'; }, 2000);
+    }
+  } catch (e) {
+    if (status) {
+      status.textContent = '✗ ' + (e?.message || 'Refresh failed');
+      setTimeout(() => { status.style.display = 'none'; }, 5000);
+    }
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.style.opacity = 1;
+    }
+  }
+}
+
 async function loadDashboard() {
   const container = document.getElementById('dashboard-content');
   container.innerHTML = '<div class="empty-hint">Loading dashboard...</div>';
@@ -1027,6 +1035,36 @@ async function testConnection() {
   setTimeout(() => { status.style.display = 'none'; }, 5000);
 }
 
+// ── Refresh ───────────────────────────────────────────────────────────────
+async function refreshData() {
+  const btn = document.getElementById('refresh-btn');
+  const status = document.getElementById('refresh-status');
+  btn.disabled = true;
+  btn.textContent = '⏳ Fetching…';
+  status.textContent = 'Fetching from CivitAI…';
+  status.style.display = 'inline';
+  try {
+    const r = await fetch('/api/refresh', { method: 'POST' });
+    const d = await r.json();
+    if (d.ok) {
+      status.textContent = `✓ Updated — ${d.snapshot.totalPosts} posts, ❤️${d.snapshot.totalHearts} 👍${d.snapshot.totalLikes}`;
+      // Reload data
+      await init();
+      dashLoaded = false;
+      if (document.getElementById('content-dashboard').classList.contains('active')) {
+        loadDashboard();
+      }
+    } else {
+      status.textContent = `✗ ${d.error || 'Refresh failed'}`;
+    }
+  } catch(e) {
+    status.textContent = `✗ Request failed: ${e.message}`;
+  }
+  btn.disabled = false;
+  btn.textContent = '🔄 Refresh';
+  setTimeout(() => { status.style.display = 'none'; }, 8000);
+}
+
 init();
 </script>
 </body>
@@ -1047,24 +1085,24 @@ def api_data():
     if not cfg.get("api_key") or not cfg.get("username"):
         return jsonify({"unconfigured": True, "posts": [], "meta": {}, "known": {}})
 
-    state = load_state()
-    meta = load_meta()
-    posts_raw = state.get("posts", {})
+    posts_raw = db.get_latest_post_stats()
+    meta = db.load_post_meta()
+    known = db.get_known_values()
 
     posts = []
-    for pid, p in sorted(posts_raw.items(), key=lambda x: x[1]["date"], reverse=True):
+    for pid, p in sorted(posts_raw.items(), key=lambda x: x[1].get("post_date", ""), reverse=True):
         posts.append({
             "postId": pid,
-            "date": p["date"],
+            "date": p.get("post_date", ""),
             "hearts": p["hearts"],
             "likes": p["likes"],
             "comments": p["comments"],
-            "imageCount": p["imageCount"],
-            "nsfwLevels": p.get("nsfwLevels", []),
+            "imageCount": p.get("image_count", 0),
+            "nsfwLevels": p.get("nsfw_levels", []),
             "score": p["hearts"] * 2 + p["likes"],
         })
 
-    return jsonify({"posts": posts, "meta": meta, "known": get_known(meta)})
+    return jsonify({"posts": posts, "meta": meta, "known": known})
 
 
 @app.route("/api/save", methods=["POST"])
@@ -1073,17 +1111,11 @@ def api_save():
     post_id = data.get("postId")
     if not post_id:
         return jsonify({"ok": False, "error": "No postId"})
-
-    meta = load_meta()
-    meta[post_id] = {
-        "title": data.get("title", ""),
-        "characters": data.get("characters", []),
-        "tags": data.get("tags", []),
-        "themes": data.get("themes", []),
-        "notes": data.get("notes", ""),
-    }
-    save_meta(meta)
-    return jsonify({"ok": True})
+    try:
+        db.save_post_meta(post_id, data)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
 
 
 @app.route("/api/dashboard")
@@ -1091,130 +1123,19 @@ def api_dashboard():
     cfg = load_config()
     if not cfg.get("api_key") or not cfg.get("username"):
         return jsonify({"unconfigured": True})
+    data = db.get_dashboard_data()
+    return jsonify(data)
 
-    state = load_state()
-    meta = load_meta()
-    posts_raw = state.get("posts", {})
-    history = state.get("history", [])
 
-    total_hearts = sum(p.get("hearts", 0) for p in posts_raw.values())
-    total_likes = sum(p.get("likes", 0) for p in posts_raw.values())
-    total_comments = sum(p.get("comments", 0) for p in posts_raw.values())
-    total_images = sum(p.get("imageCount", 0) for p in posts_raw.values())
-    total_posts = len(posts_raw)
-
-    delta = None
-    if len(history) >= 2:
-        curr, prev = history[-1], history[-2]
-        delta = {
-            "hearts": curr.get("totalHearts", 0) - prev.get("totalHearts", 0),
-            "likes": curr.get("totalLikes", 0) - prev.get("totalLikes", 0),
-            "comments": curr.get("totalComments", 0) - prev.get("totalComments", 0),
-        }
-
-    def get_post_labels(pid):
-        if pid in meta:
-            m = meta[pid]
-            chars = m.get("characters", [])
-            tags = m.get("tags", [])
-            themes_list = m.get("themes", [])
-            if not themes_list and m.get("theme"):
-                themes_list = [m["theme"]]
-            return chars, tags, themes_list
-        p = posts_raw.get(pid, {})
-        chars = p.get("characters", [])
-        tags = p.get("tags", [])
-        theme = p.get("theme", "")
-        return chars, tags, [theme] if theme else []
-
-    char_scores = defaultdict(int)
-    tag_scores = defaultdict(int)
-    theme_scores = defaultdict(int)
-
-    for pid, p in posts_raw.items():
-        s = p.get("hearts", 0) * 2 + p.get("likes", 0)
-        chars, tags, themes_list = get_post_labels(pid)
-        if chars or tags or themes_list:
-            for c in chars:
-                if c: char_scores[c] += s
-            for t in tags:
-                if t: tag_scores[t] += s
-            for th in themes_list:
-                if th: theme_scores[th] += s
-
-    top_characters = [{"label": k, "value": v} for k, v in sorted(char_scores.items(), key=lambda x: -x[1])[:8]]
-    top_tags = [{"label": k, "value": v} for k, v in sorted(tag_scores.items(), key=lambda x: -x[1])[:8]]
-    top_themes = [{"label": k, "value": v} for k, v in sorted(theme_scores.items(), key=lambda x: -x[1])[:6]]
-
-    def post_score(pid):
-        p = posts_raw[pid]
-        return p.get("hearts", 0) * 2 + p.get("likes", 0)
-
-    sorted_pids = sorted(posts_raw.keys(), key=post_score, reverse=True)[:10]
-    best_posts = []
-    for pid in sorted_pids:
-        p = posts_raw[pid]
-        chars, tags, themes_list = get_post_labels(pid)
-        title = (meta.get(pid) or {}).get("title") or p.get("title") or None
-        best_posts.append({
-            "postId": pid, "title": title, "date": p.get("date", ""),
-            "characters": chars, "nsfwLevels": list(set(p.get("nsfwLevels", []))),
-            "hearts": p.get("hearts", 0), "likes": p.get("likes", 0),
-            "score": post_score(pid),
-        })
-
-    nsfw_buckets = defaultdict(list)
-    for pid, p in posts_raw.items():
-        levels = list(set(p.get("nsfwLevels", [])))
-        s = post_score(pid)
-        level = "X" if "X" in levels else "Mature" if "Mature" in levels else "None"
-        nsfw_buckets[level].append(s)
-
-    nsfw_breakdown = [
-        {"level": lvl, "avg_score": round(sum(scores) / len(scores), 1), "count": len(scores)}
-        for lvl in ["None", "Mature", "X"]
-        if (scores := nsfw_buckets.get(lvl, []))
-    ]
-
-    img_buckets = {"1": [], "2-5": [], "6-10": [], "11+": []}
-    for pid, p in posts_raw.items():
-        n = p.get("imageCount", 0)
-        s = post_score(pid)
-        if n == 1: img_buckets["1"].append(s)
-        elif n <= 5: img_buckets["2-5"].append(s)
-        elif n <= 10: img_buckets["6-10"].append(s)
-        else: img_buckets["11+"].append(s)
-
-    image_buckets = [
-        {"label": label, "avg_score": round(sum(scores) / len(scores), 1), "count": len(scores)}
-        for label, scores in img_buckets.items() if scores
-    ]
-
-    recent_sorted = sorted(posts_raw.items(), key=lambda x: x[1].get("date", ""), reverse=True)[:5]
-    recent_posts = []
-    for pid, p in recent_sorted:
-        chars, _, _ = get_post_labels(pid)
-        title = (meta.get(pid) or {}).get("title") or p.get("title") or None
-        recent_posts.append({
-            "postId": pid, "title": title, "date": p.get("date", ""),
-            "characters": chars, "hearts": p.get("hearts", 0),
-            "likes": p.get("likes", 0), "comments": p.get("comments", 0),
-        })
-
-    return jsonify({
-        "totals": {
-            "hearts": total_hearts, "likes": total_likes, "comments": total_comments,
-            "posts": total_posts, "images": total_images,
-        },
-        "delta": delta,
-        "top_characters": top_characters,
-        "top_tags": top_tags,
-        "top_themes": top_themes,
-        "best_posts": best_posts,
-        "nsfw_breakdown": nsfw_breakdown,
-        "image_buckets": image_buckets,
-        "recent_posts": recent_posts,
-    })
+@app.route("/api/refresh", methods=["POST"])
+def api_refresh():
+    try:
+        report = civitai_tracker.main()
+        if report is None:
+            return jsonify({"ok": False, "error": "Tracker returned no data — check credentials"})
+        return jsonify({"ok": True, "snapshot": report["snapshot"]})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
 
 
 @app.route("/api/config", methods=["GET"])
